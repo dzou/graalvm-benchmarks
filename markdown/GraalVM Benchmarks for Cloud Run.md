@@ -38,15 +38,17 @@ def redeploy(container_name):
     return env_code
 
 def send_request(function_url, coldstart=False):
+    TOKEN = run_command('gcloud auth print-identity-token')
     if coldstart and '?coldstart' not in function_url:
         function_url += '?coldstart'
     
+    # Notes on time.time() precision for linux: https://stackoverflow.com/a/1938096/906497
+    # On linux & mac, time precision < 1 microsecond.
     start = time.time()
     response = requests.get(function_url, headers = {'Authorization': 'Bearer %s' % TOKEN})
     end = time.time()
     
-    
-    print(function_url + " | code: " + str(response.status_code))
+    # print(function_url + " | code: " + str(response.status_code))
     if response.status_code == 429:
         time.sleep(30)
     
@@ -55,11 +57,8 @@ def send_request(function_url, coldstart=False):
     else:
         return send_request(function_url, coldstart)
 
-def write_data(number_list, file_name):
-    with open(file_name, 'w') as file:
-        file.write(",".join(map(lambda num: "%.3f" % float(num), number_list)))
-    
-TOKEN = run_command('gcloud auth print-identity-token')
+
+
 ```
 
 ## Cold Start Analysis
@@ -85,36 +84,41 @@ Also note, in the Cloud Run settings, `max_instances == 1` to ensure that only o
 
 
 ```python
+import csv
 import os.path
+import time
 
-def parseNumbers(filename):
+def write_data(request_tuples, file_name):
+    output = list(map(lambda tuple: str(tuple[0]) + "," + str(tuple[1]), request_tuples))
+    with open(file_name, 'a') as file:
+        file.write("\n".join(output) + "\n")
+
+def parse_numbers(filename):
     result = []
     with open(filename, 'r') as file:
-        data = file.read().split(",")
-        result = list(map(lambda x: float(x), data))
+        data = csv.reader(file, delimiter=',')
+        for row in data:
+            result.append((int(row[0]), float(row[1])))
+        
     return result
 
 # Sequential Cold Start Requests
-def sequential_cold_start_request(fn_name, times=100):
+def sequential_cold_start_request(fn_name, file_name, times=1000):
     print("Sequential cold start tests: " + fn_name)
-    results = []
     for i in range(times):
         result = send_request(URLS[fn_name], True)
-        results.append(result)
         print("Request %s: time = %.3f" % (fn_name, result))
+        datum = (int(round(time.time() * 1000)), result)
+        write_data(datum, file_name)
         time.sleep(5)
-    return results
 
-def test_coldstarts(func_name, file_name):
-    if os.path.isfile(file_name):
-        return parseNumbers(file_name)
-    else:
-        result = sequential_cold_start_request(func_name)
-        write_data(result, file_name)
-        return result
+# for i in range(4):
+#     sequential_cold_start_request(STD_JAVA_FN, 'std_java_coldstart_bulk.txt', 500)
+#     sequential_cold_start_request(GRAAL_FN, 'graalvm_java_coldstart_bulk.txt', 500)
+    
 
-std_java_results = test_coldstarts(STD_JAVA_FN, 'std_java_coldstarts.txt')
-graalvm_results = test_coldstarts(GRAAL_FN, 'graalvm_coldstarts.txt')
+std_java_results = list(zip(*parse_numbers('std_java_coldstart_bulk.txt')))[1]
+graalvm_results = list(zip(*parse_numbers('graalvm_java_coldstart_bulk.txt')))[1]
 ```
 
 
@@ -130,20 +134,26 @@ def printStats(data, title):
     print('99p = %.3f' % np.percentile(data, 99))
     print()
 
-def plotHistogram(data, title, labels, range=None):
-    plt.hist(data, bins=50, histtype='barstacked', label=labels, alpha=0.7, range=range)  # density=False would make counts
+def plotHistogram(data, title, labels, **kwargs):
+    plt.hist(data, bins=50, histtype='barstacked', label=labels, alpha=0.7, **kwargs)  # density=False would make counts
     plt.ylabel('Count')
     plt.xlabel('Latency (seconds)');
     plt.title(title)
     plt.legend()
+
+def percentileOf(threshold, d):
+    return sum(np.abs(d) < threshold) / float(len(d))
     
-plotHistogram([std_java_results], 'Cold Start Latencies', ['Standard Java 11'])
-plotHistogram([graalvm_results], 'Cold Start Latencies (requests=100 each)', ['GraalVM'])
+plotHistogram([std_java_results], 'Cold Start Latencies (n=1500)', ['Standard Java 11'], range=(0,6.5))
+plt.show()
+plotHistogram([graalvm_results], 'Cold Start Latencies (n=1500)', ['GraalVM'], range=(0,6.5), color='darkorange')
 plt.show()
 
 printStats(std_java_results, 'Standard Java Cold Start Latencies Percentiles')
 printStats(graalvm_results, 'GraalVM Cold Start Latencies Percentiles')
 
+graal_slow_percentile = percentileOf(2, graalvm_results) * 100
+print('%.2f percent of cold starts were < 1 second.' % graal_slow_percentile)
 ```
 
 
@@ -152,18 +162,25 @@ printStats(graalvm_results, 'GraalVM Cold Start Latencies Percentiles')
     
 
 
+
+    
+![png](output_5_1.png)
+    
+
+
     Standard Java Cold Start Latencies Percentiles
-    Mean = 3.900
-    Median (50p) = 3.870
-    95p = 4.439
-    99p = 4.650
+    Mean = 3.448
+    Median (50p) = 3.426
+    95p = 4.173
+    99p = 4.852
     
     GraalVM Cold Start Latencies Percentiles
-    Mean = 0.659
-    Median (50p) = 0.558
-    95p = 1.075
-    99p = 2.189
+    Mean = 0.790
+    Median (50p) = 0.399
+    95p = 3.438
+    99p = 3.759
     
+    83.60 percent of cold starts were < 1 second.
 
 
 ## Sequential Warm Requests Experiment
@@ -172,33 +189,59 @@ Send requests sequentially to warmed Cloud Run instance.
 
 
 ```python
-def sequential_requests(fn_name, times=1000):
-    print("Normal Requests: " + fn_name)
-    results = []
+from datetime import datetime
+from matplotlib.ticker import ScalarFormatter
+
+def sequential_request(fn_name, file_name, times=10):
+    write_result = []
     for i in range(times):
         result = send_request(URLS[fn_name], False)
-        results.append(result)
-        print("Request %s: time = %.3f" % (fn_name, result))
-    return results
+        datum = (int(round(time.time())), result)
+        write_result.append(datum)
+        # print("Request %s: time = %.3f" % (fn_name, result))    
+    write_data(write_result, file_name)
 
-def test_sequential_requests(func_name, file_name):
-    if os.path.isfile(file_name):
-        return parseNumbers(file_name)
-    else:
-        result = sequential_requests(func_name)
-        write_data(result, file_name)
-        return result
 
-std_java_warm = test_sequential_requests(STD_JAVA_FN, 'std_java_warm_requests.txt')
-graalvm_warm = test_sequential_requests(GRAAL_FN, 'graalvm_warm_requests.txt')
+# for i in range(200000):
+#     sequential_request(STD_JAVA_FN, 'std_java_warm_requests_bulk.txt', times=1)
+#     sequential_request(GRAAL_FN, 'graalvm_warm_requests_bulk.txt', times=1)
+#     if i % 100 == 0: 
+#         print("iters: " + str(i))
 
-plotHistogram([std_java_warm], 'Warm Request Latencies (requests=1000)', ['Standard Java 11'], range=(0, 0.3))
+std_java_ts = list(zip(*parse_numbers('std_java_warm_requests_bulk.txt')))[0]
+std_java_ts = list(map(lambda x: datetime.fromtimestamp(x), std_java_ts))
+std_java_warm = list(zip(*parse_numbers('std_java_warm_requests_bulk.txt')))[1]
+
+graalvm_ts = list(zip(*parse_numbers('graalvm_warm_requests_bulk.txt')))[0]
+graalvm_ts = list(map(lambda x: datetime.fromtimestamp(x), graalvm_ts))
+graalvm_warm = list(zip(*parse_numbers('graalvm_warm_requests_bulk.txt')))[1]
+
+plotHistogram([std_java_warm], 'Warm Request Latencies (requests=60k)', ['Standard Java 11'], range=(0, 0.1))
 plt.show()
-plotHistogram([graalvm_warm], 'Warm Request Latencies (requests=1000)', ['GraalVM'], range=(0, 0.3))
+plotHistogram([graalvm_warm], 'Warm Request Latencies (requests=60k)', ['GraalVM'], range=(0, 0.1), color='darkorange')
 plt.show()
 
 printStats(std_java_warm, 'Std. Java Warm Latencies')
 printStats(graalvm_warm, 'GraalVM Warm Latencies')
+
+def plot_scatter(x, y, **kwargs):
+    
+    fig, ax = plt.subplots()
+    fig.autofmt_xdate()
+    fig.set_figheight(5)
+    fig.set_figwidth(15)
+    
+    ax.set_yscale('log')
+    ax.yaxis.set_major_formatter(ScalarFormatter())
+    ax.set_xlabel('Time of request')
+    ax.set_ylabel('Latency in seconds (Log-scale)') 
+    
+    plt.scatter(x, y, s=10, **kwargs)
+    plt.title('Warm Latencies Over Time (n=60,000)')
+    plt.legend()
+
+plot_scatter(std_java_ts, std_java_warm, label='Standard Java 11')
+plot_scatter(graalvm_ts, graalvm_warm, color='darkorange', label='GraalVM')
 
 ```
 
@@ -215,16 +258,28 @@ printStats(graalvm_warm, 'GraalVM Warm Latencies')
 
 
     Std. Java Warm Latencies
-    Mean = 0.120
-    Median (50p) = 0.118
-    95p = 0.140
-    99p = 0.155
+    Mean = 0.027
+    Median (50p) = 0.026
+    95p = 0.034
+    99p = 0.042
     
     GraalVM Warm Latencies
-    Mean = 0.117
-    Median (50p) = 0.117
-    95p = 0.137
-    99p = 0.154
+    Mean = 0.028
+    Median (50p) = 0.026
+    95p = 0.034
+    99p = 0.044
+    
+
+
+
+    
+![png](output_7_3.png)
+    
+
+
+
+    
+![png](output_7_4.png)
     
 
 
